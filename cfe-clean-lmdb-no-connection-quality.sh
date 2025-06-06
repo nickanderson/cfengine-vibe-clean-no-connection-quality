@@ -9,19 +9,33 @@ usage() {
     echo "  LOG_FILE: Path to the log file. If not provided, reads from stdin."
     echo ""
     echo "Options:"
-    echo "  -h, --help    Display this help message."
-    echo "  --limit N     Process at most N hostkeys. Default is no limit."
-    echo "  --dry-run     Simulate the removal process without actually running cf-key --remove-keys."
+    echo "  -h, --help                Display this help message."
+    echo "  --limit N                 Process at most N hostkeys. Default is no limit."
+    echo "  --dry-run                 Simulate the removal process without actually running cf-key --remove-keys."
+    echo "  --cfe-module-protocol F   Write CFEngine module protocol output to file F for affected hostkeys."
     echo ""
     echo "Example:"
     echo "  $0 /var/log/cfengine/hub.log"
-    echo "  journalctl -u cf-hub | $0 --limit 10 --dry-run"
+    echo "  journalctl -u cf-hub | $0 --limit 10 --dry-run --cfe-module-protocol /tmp/cf_module_output.txt"
     exit 1
 }
 
-# Initialize limit and dry_run variables
+# Initialize limit, dry_run, and cfe_module_protocol_file variables
 LIMIT=""
 DRY_RUN=false
+CFE_MODULE_PROTOCOL_FILE=""
+TEMP_CFE_PROTOCOL_FILE="" # New variable for temporary file
+
+# Function to clean up temporary file on exit
+cleanup_temp_file() {
+    if [[ -n "$TEMP_CFE_PROTOCOL_FILE" && -f "$TEMP_CFE_PROTOCOL_FILE" ]]; then
+        rm -f "$TEMP_CFE_PROTOCOL_FILE"
+        echo "Cleaned up temporary file: $TEMP_CFE_PROTOCOL_FILE" >&2
+    fi
+}
+
+# Trap signals to ensure cleanup
+trap cleanup_temp_file EXIT HUP INT QUIT TERM
 
 # Parse command-line options
 while [[ "$#" -gt 0 ]]; do
@@ -40,6 +54,15 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            ;;
+        --cfe-module-protocol)
+            if [[ -n "$2" ]]; then
+                CFE_MODULE_PROTOCOL_FILE="$2"
+                shift # Consume the argument value
+            else
+                echo "Error: --cfe-module-protocol requires a file path argument." >&2
+                usage
+            fi
             ;;
         *)
             # Assume it's the log file path if not an option
@@ -65,6 +88,23 @@ if [[ "$INPUT_SOURCE" != "/dev/stdin" && ! -f "$INPUT_SOURCE" ]]; then
     usage
 fi
 
+# If CFE module protocol file is specified, create a temporary file
+if [[ -n "$CFE_MODULE_PROTOCOL_FILE" ]]; then
+    # Create a temporary file in the same directory as the target, if possible,
+    # or in /tmp if the target directory is not writable or doesn't exist.
+    TARGET_DIR=$(dirname "$CFE_MODULE_PROTOCOL_FILE")
+    if [[ -w "$TARGET_DIR" ]]; then
+        TEMP_CFE_PROTOCOL_FILE=$(mktemp "$TARGET_DIR/$(basename "$CFE_MODULE_PROTOCOL_FILE").XXXXXX")
+    else
+        TEMP_CFE_PROTOCOL_FILE=$(mktemp "/tmp/$(basename "$CFE_MODULE_PROTOCOL_FILE").XXXXXX")
+    fi
+
+    if [[ -z "$TEMP_CFE_PROTOCOL_FILE" ]]; then
+        echo "Error: Failed to create temporary file for --cfe-module-protocol." >&2
+        exit 1
+    fi
+    echo "CFEngine module protocol output will be staged in temporary file: $TEMP_CFE_PROTOCOL_FILE"
+fi
 
 # Declare a regular array to store unique hostkeys
 # This array will be populated in the current shell context.
@@ -109,7 +149,6 @@ for hostkey in "${unique_hostkeys[@]}"; do
     # Construct the PostgreSQL query command
     # We're checking if the hostkey exists and was deleted more than 30 days ago.
     # The 'deleted' column is a timestamp, so we compare it with NOW() - INTERVAL '30 days'.
-    # Changed 'sql cfdb -c' to 'psql -d cfdb -t -c'
     # -t (or --tuples-only) is added to suppress headers and footers from psql output,
     # making it easier to parse programmatically.
     PG_QUERY="select hostkey from __hosts where hostkey = '$hostkey' AND deleted < NOW() - INTERVAL '30 days'"
@@ -120,11 +159,20 @@ for hostkey in "${unique_hostkeys[@]}"; do
     # We check the exit code and the output.
     if PG_RESULT=$("${SQL_COMMAND[@]}" 2>/dev/null); then
         # Check if the hostkey was returned by the SQL query (i.e., it's in the output)
-        # We trim whitespace from PG_RESULT before checking.
-        if [[ "$(echo "$PG_RESULT" | tr -d '[:space:]')" == "$(echo "$hostkey" | tr -d '[:space:]')" ]]; then
+        # Using grep -q is more robust than string comparison for psql output.
+        if echo "$PG_RESULT" | grep -q "$hostkey"; then
             echo "  Hostkey $hostkey found in PostgreSQL and deleted more than 30 days ago."
             CF_KEY_COMMAND=("cf-key" "--remove-keys" "$hostkey" "--force")
             echo "  Attempting to remove from cf_lastseen.lmdb: ${CF_KEY_COMMAND[*]}"
+
+            # Write to CFE module protocol temporary file if specified
+            if [[ -n "$TEMP_CFE_PROTOCOL_FILE" ]]; then
+                # Strip "SHA=" from the hostkey for the variable name
+                hostkey_no_sha="${hostkey#SHA=}"
+                echo "^meta=inventory,attribute_name=Missing connection quality info" >> "$TEMP_CFE_PROTOCOL_FILE"
+                echo "=no_quality_info_in_db_deleted[$hostkey_no_sha]= $hostkey" >> "$TEMP_CFE_PROTOCOL_FILE"
+                echo "  Added CFEngine module protocol entry to temporary file."
+            fi
 
             if $DRY_RUN; then
                 echo "  (DRY RUN) Would execute: ${CF_KEY_COMMAND[*]}"
@@ -149,5 +197,16 @@ for hostkey in "${unique_hostkeys[@]}"; do
     processed_count=$((processed_count + 1))
 done
 
-echo -e "\n--- Script execution finished ---"
+# Move the temporary file to the final destination if CFE_MODULE_PROTOCOL_FILE was specified
+if [[ -n "$CFE_MODULE_PROTOCOL_FILE" && -f "$TEMP_CFE_PROTOCOL_FILE" ]]; then
+    echo -e "\n--- Finalizing CFEngine module protocol output ---"
+    if mv "$TEMP_CFE_PROTOCOL_FILE" "$CFE_MODULE_PROTOCOL_FILE"; then
+        echo "Successfully moved temporary protocol file to: $CFE_MODULE_PROTOCOL_FILE"
+    else
+        echo "Error: Failed to move temporary protocol file '$TEMP_CFE_PROTOCOL_FILE' to '$CFE_MODULE_PROTOCOL_FILE'." >&2
+        echo "The temporary file might still exist at '$TEMP_CFE_PROTOCOL_FILE'." >&2
+        exit 1 # Exit with an error code if the move fails
+    fi
+fi
 
+echo -e "\n--- Script execution finished ---"
