@@ -1,0 +1,68 @@
+#+TITLE: CFEngine LMDB Cleanup Script (No Connection Quality)
+
+* Introduction
+This script automates the cleanup of stale host entries from CFEngine's =cf_lastseen.lmdb= database. It identifies hostkeys that consistently report "No connection quality information" in CFEngine logs and have been marked as deleted in the PostgreSQL =cfdb= database for more than 30 days. This helps maintain a clean and efficient CFEngine hub by removing data for long-gone or problematic clients.
+
+* Features
+- Parses CFEngine logs (or stdin) to extract hostkeys with "No connection quality information" warnings.
+- Queries the PostgreSQL =cfdb= database to verify if the extracted hostkeys are marked as deleted and have been so for over 30 days.
+- Integrates with =cf-key --remove-keys= to purge confirmed stale hostkeys from =cf_lastseen.lmdb=.
+- Supports a =--dry-run= mode for simulating removals without actual changes.
+- Allows limiting the number of hostkeys processed.
+- Can generate CFEngine module protocol output for affected hostkeys, useful for inventory or reporting.
+
+* Prerequisites
+- *CFEngine Hub*: The script is intended to run on a CFEngine hub.
+- *Bash*: A modern Bash environment (version 4+ recommended).
+- *Core Utilities*: =grep=, =sed=, =sort=, =mktemp=, =mv=.
+- *PostgreSQL Client*: The =psql= command-line client must be installed and configured to connect to the =cfdb= database (e.g., via =pg_hba.conf= or environment variables like =PGUSER=, =PGPASSWORD=). The user running the script needs read access to the =cfdb= database, specifically the =__hosts= table.
+- *CFEngine Utilities*: The =cf-key= utility must be available in the system's PATH. The user running the script must have permissions to execute =cf-key --remove-keys= (often requires =sudo= or running as =root=).
+
+* Usage
+
+** Basic Usage
+To process a specific log file:
+#+begin_src bash
+./cfe-clean-lmdb-no-connection-quality.sh /var/log/cfengine/hub.log
+#+end_src
+
+** Using with =journalctl=
+To pipe output from =journalctl= (e.g., for a systemd service):
+#+begin_src bash
+journalctl -u cf-hub | ./cfe-clean-lmdb-no-connection-quality.sh
+#+end_src
+
+** Options
+
+- =-h, --help=: Display usage information.
+- =--limit N=: Process at most =N= hostkeys. Useful for testing or staged rollouts.
+- =--dry-run=: Simulate the removal process without actually running =cf-key --remove-keys=. This is highly recommended for initial testing.
+- =--cfe-module-protocol F=: Write CFEngine module protocol output to file =F= for affected hostkeys. This file can then be consumed by CFEngine policies for inventory or reporting purposes.
+
+** Examples
+
+1.  **Dry run with a limit of 5 hostkeys from =journalctl= output:**
+    #+begin_src bash
+    journalctl -u cf-hub | ./cfe-clean-lmdb-no-connection-quality.sh --limit 5 --dry-run
+    #+end_src
+
+2.  **Perform actual cleanup and generate module protocol output:**
+    #+begin_src bash
+    sudo ./cfe-clean-lmdb-no-connection-quality.sh /var/log/cfengine/hub.log --cfe-module-protocol /tmp/cf_module_output.txt
+    #+end_src
+    (Note: =sudo= is often required for =cf-key= execution.)
+
+* How it Works
+1.  The script first parses the provided log input (file or stdin) using =grep= and =sed= to find unique hostkeys (SHA-256 hashes) associated with the "No connection quality information" warning.
+2.  For each unique hostkey found, it executes a =psql= query against the =cfdb= database. This query checks if the hostkey exists in the =__hosts= table and if its =deleted= timestamp is older than 30 days from the current time.
+3.  If a hostkey meets both criteria (found in logs *and* deleted in DB for >30 days), the script proceeds to remove it.
+4.  In =--dry-run= mode, it only prints the command that *would* be executed.
+5.  Otherwise, it runs =cf-key --remove-keys <hostkey> --force= to purge the entry from =cf_lastseen.lmdb=.
+6.  If =--cfe-module-protocol= is specified, it writes relevant inventory data to a temporary file, which is then moved to the final destination upon script completion.
+
+* Important Notes
+- *Permissions*: Ensure the user running the script has appropriate permissions to read the log file, query the PostgreSQL database, and execute =cf-key --remove-keys=. Running with =sudo= is often necessary for the latter.
+- *PostgreSQL Connection*: If =psql= fails, verify your PostgreSQL client configuration and database access permissions.
+- *30-Day Policy*: The script strictly adheres to a 30-day deletion policy. Hostkeys deleted more recently than 30 days will *not* be removed from LMDB by this script. This is a safety measure to prevent premature removal of recently deleted hosts.
+- *Idempotency*: Running the script multiple times is safe; it will only attempt to remove hostkeys that still meet the criteria.
+- *Temporary Files*: The script uses a temporary file for the CFEngine module protocol output to ensure atomicity and prevent partial writes. This file is automatically cleaned up on exit or successful completion.
